@@ -1,0 +1,16 @@
+
+# Baza de date locala
+instagenie.db
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Medii virtuale
+venv/
+.venv/
+
+# Configurari locale
+.env
+.idea/
