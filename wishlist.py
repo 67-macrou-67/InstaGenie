@@ -1,316 +1,306 @@
 
-import flet as ft
-
-from datetime import date
-from urllib.parse import urlparse
-
-from database import create_tables
-from users import register_user, login_user
-from wishlist import (
-    get_products,
-    add_product,
-    update_product,
-    delete_product
-)
+from database import connect
+from datetime import datetime
+import secrets
 
 
-def main(page: ft.Page):
-    page.title = "InstaGenie"
+# --------------------------------------------------
+# WISHLIST-UL PROPRIU
+# --------------------------------------------------
 
-    create_tables()
+def get_products(user_id):
+    con = connect()
+    cur = con.cursor()
 
-    def show_message(message):
-        print(message)
+    cur.execute("""
+        SELECT id, name, image_url, product_url
+        FROM wishlist_items
+        WHERE user_id = ?
+        ORDER BY id DESC
+    """, (user_id,))
 
-        snack_bar = ft.SnackBar(content=ft.Text(message))
-        page.snack_bar = snack_bar
-        snack_bar.open = True
-        page.update()
+    products = cur.fetchall()
+    con.close()
+    return products
 
-    def valid_url(url):
-        try:
-            parsed = urlparse(url.strip())
-            return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-        except ValueError:
-            return False
 
-    def show_home(user):
-        page.clean()
+def add_product(user_id, name, image_url, product_url):
+    con = connect()
+    cur = con.cursor()
 
-        page.add(
-            ft.Text(f"Bun venit, {user['name']}!", size=25),
-            ft.Text(f"Username: @{user['username']}"),
-            ft.Text(f"Data nașterii: {user['birth_date']}"),
-            ft.Button(
-                "Lista mea de dorințe",
-                on_click=lambda e: show_wishlist(user)
-            ),
-            ft.Button(
-                "Deconectare",
-                on_click=show_login
+    cur.execute("""
+        INSERT INTO wishlist_items
+        (user_id, name, image_url, product_url)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, name.strip(), image_url.strip(), product_url.strip()))
+
+    con.commit()
+    con.close()
+
+
+def update_product(product_id, user_id, name, image_url, product_url):
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        UPDATE wishlist_items
+        SET name = ?, image_url = ?, product_url = ?
+        WHERE id = ? AND user_id = ?
+    """, (
+        name.strip(),
+        image_url.strip(),
+        product_url.strip(),
+        product_id,
+        user_id
+    ))
+
+    con.commit()
+    updated = cur.rowcount > 0
+    con.close()
+    return updated
+
+
+def delete_product(product_id, user_id):
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        DELETE FROM wishlist_items
+        WHERE id = ? AND user_id = ?
+    """, (product_id, user_id))
+
+    con.commit()
+    deleted = cur.rowcount > 0
+    con.close()
+    return deleted
+
+
+# --------------------------------------------------
+# DISTRIBUIREA WISHLIST-ULUI
+# --------------------------------------------------
+
+def get_share_token(user_id):
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute(
+        "SELECT share_token FROM users WHERE id = ?",
+        (user_id,)
+    )
+    result = cur.fetchone()
+
+    if not result:
+        con.close()
+        return None
+
+    token = result[0]
+
+    if not token:
+        token = secrets.token_urlsafe(16)
+        cur.execute(
+            "UPDATE users SET share_token = ? WHERE id = ?",
+            (token, user_id)
+        )
+        con.commit()
+
+    con.close()
+    return token
+
+
+def get_user_by_share_token(token):
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT id, username, name
+        FROM users
+        WHERE share_token = ?
+    """, (token,))
+
+    user = cur.fetchone()
+    con.close()
+
+    if not user:
+        return None
+
+    return {
+        "id": user[0],
+        "username": user[1],
+        "name": user[2]
+    }
+
+
+# --------------------------------------------------
+# VIZUALIZAREA WISHLIST-ULUI ALTUI UTILIZATOR
+# --------------------------------------------------
+
+def get_products_for_viewer(owner_id, viewer_id):
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT id, name, image_url, product_url
+        FROM wishlist_items
+        WHERE user_id = ?
+        ORDER BY id DESC
+    """, (owner_id,))
+
+    products = cur.fetchall()
+    result = []
+
+    for product in products:
+        product_id = product[0]
+
+        # Proprietarul nu primește informații despre cumpărători
+        if owner_id == viewer_id:
+            interactions = []
+        else:
+            cur.execute("""
+                SELECT users.username, users.name,
+                       wishlist_interactions.status
+                FROM wishlist_interactions
+                JOIN users
+                    ON users.id = wishlist_interactions.user_id
+                WHERE wishlist_interactions.product_id = ?
+                ORDER BY wishlist_interactions.updated_at DESC
+            """, (product_id,))
+
+            interactions = [
+                {
+                    "username": row[0],
+                    "name": row[1],
+                    "status": row[2]
+                }
+                for row in cur.fetchall()
+            ]
+
+        result.append({
+            "id": product[0],
+            "name": product[1],
+            "image_url": product[2],
+            "product_url": product[3],
+            "interactions": interactions
+        })
+
+    con.close()
+    return result
+
+
+# --------------------------------------------------
+# URMEAZĂ SĂ-L CUMPĂR / L-AM CUMPĂRAT
+# --------------------------------------------------
+
+
+def set_product_status(product_id, user_id, status):
+    if status not in ("planned", "bought"):
+        raise ValueError("Starea selectată nu este validă.")
+
+    con = connect()
+
+    try:
+        # Blocăm temporar alte modificări concurente
+        con.execute("BEGIN IMMEDIATE")
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT user_id
+            FROM wishlist_items
+            WHERE id = ?
+        """, (product_id,))
+
+        product = cur.fetchone()
+
+        if not product:
+            raise ValueError("Produsul nu există.")
+
+        if product[0] == user_id:
+            raise ValueError(
+                "Nu poți selecta o stare pentru propriul produs."
             )
-        )
 
-        page.update()
+        # Verificăm dacă altcineva a cumpărat deja produsul
+        cur.execute("""
+            SELECT users.name
+            FROM wishlist_interactions
+            JOIN users
+                ON users.id = wishlist_interactions.user_id
+            WHERE wishlist_interactions.product_id = ?
+              AND wishlist_interactions.status = 'bought'
+              AND wishlist_interactions.user_id != ?
+            LIMIT 1
+        """, (product_id, user_id))
 
-    def show_wishlist(user):
-        page.clean()
+        bought_by = cur.fetchone()
 
-        products = get_products(user["id"])
-
-        page.add(
-            ft.Text("Lista mea de dorințe", size=25),
-            ft.Button(
-                "Adaugă produs",
-                on_click=lambda e: show_product_form(user)
-            )
-        )
-
-        if not products:
-            page.add(ft.Text("Nu ai adăugat încă niciun produs."))
-
-        for product in products:
-            product_id, name, image_url, product_url = product
-
-            page.add(
-                ft.Divider(),
-                ft.Text(name, size=20),
-                ft.Image(
-                    src=image_url,
-                    width=180,
-                    height=180
-                ),
-                ft.Text(f"Link magazin: {product_url}"),
-                ft.Row(
-                    controls=[
-                        ft.Button(
-                            "Deschide magazinul",
-                            on_click=lambda e, url=product_url:
-                                page.launch_url(url)
-                        ),
-                        ft.Button(
-                            "Modifică",
-                            on_click=lambda e, p=product:
-                                show_product_form(user, p)
-                        ),
-                        ft.Button(
-                            "Șterge",
-                            on_click=lambda e, pid=product_id:
-                                remove_product(user, pid)
-                        )
-                    ],
-                    wrap=True
-                )
+        if bought_by:
+            raise ValueError(
+                f"Acest produs a fost deja cumpărat de {bought_by[0]}!"
             )
 
-        page.add(
-            ft.Divider(),
-            ft.TextButton(
-                "Înapoi la profil",
-                on_click=lambda e: show_home(user)
-            )
-        )
+        # Salvăm sau actualizăm alegerea
+        cur.execute("""
+            INSERT INTO wishlist_interactions
+                (product_id, user_id, status, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(product_id, user_id)
+            DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at
+        """, (
+            product_id,
+            user_id,
+            status,
+            datetime.now().isoformat(timespec="seconds")
+        ))
 
-        page.update()
+        con.commit()
 
-    def remove_product(user, product_id):
-        delete_product(product_id, user["id"])
-        show_message("Produsul a fost șters.")
-        show_wishlist(user)
+    except Exception:
+        con.rollback()
+        raise
 
-    def show_product_form(user, product=None):
-        page.clean()
-
-        editing = product is not None
-
-        name = ft.TextField(
-            label="Numele produsului",
-            value=product[1] if editing else ""
-        )
-
-        image_url = ft.TextField(
-            label="Link către imagine",
-            value=product[2] if editing else ""
-        )
-
-        product_url = ft.TextField(
-            label="Link către magazin",
-            value=product[3] if editing else ""
-        )
-
-        def submit(e):
-            product_name = (name.value or "").strip()
-            image = (image_url.value or "").strip()
-            link = (product_url.value or "").strip()
-
-            if not product_name or not image or not link:
-                show_message("Completează toate câmpurile.")
-                return
-
-            if not valid_url(image):
-                show_message("Linkul imaginii trebuie să înceapă cu http:// sau https://.")
-                return
-
-            if not valid_url(link):
-                show_message("Linkul magazinului nu este valid.")
-                return
-
-            try:
-                if editing:
-                    update_product(
-                        product[0],
-                        user["id"],
-                        product_name,
-                        image,
-                        link
-                    )
-                    show_message("Produsul a fost modificat.")
-                else:
-                    add_product(
-                        user["id"],
-                        product_name,
-                        image,
-                        link
-                    )
-                    show_message("Produsul a fost adăugat.")
-
-                show_wishlist(user)
-
-            except Exception as ex:
-                print("Eroare la salvarea produsului:", repr(ex))
-                show_message("Nu am putut salva produsul.")
-
-        page.add(
-            ft.Text(
-                "Modifică produsul" if editing else "Adaugă produs",
-                size=25
-            ),
-            name,
-            image_url,
-            product_url,
-            ft.Button(
-                "Salvează",
-                on_click=submit
-            ),
-            ft.TextButton(
-                "Înapoi la listă",
-                on_click=lambda e: show_wishlist(user)
-            )
-        )
-
-        page.update()
-
-    def show_register(e=None):
-        page.clean()
-
-        name = ft.TextField(label="Nume complet")
-        username = ft.TextField(label="Username")
-        birth_date = ft.TextField(
-            label="Data nașterii (YYYY-MM-DD)"
-        )
-        password = ft.TextField(
-            label="Parolă",
-            password=True,
-            can_reveal_password=True
-        )
-
-        def submit(e):
-            nume = (name.value or "").strip()
-            user_name = (username.value or "").strip()
-            data_nasterii = (birth_date.value or "").strip()
-            parola = password.value or ""
-
-            if not all([nume, user_name, data_nasterii, parola]):
-                show_message("Completează toate câmpurile.")
-                return
-
-            try:
-                date.fromisoformat(data_nasterii)
-            except ValueError:
-                show_message("Data trebuie să fie YYYY-MM-DD.")
-                return
-
-            if len(parola) < 8:
-                show_message("Parola trebuie să aibă minimum 8 caractere.")
-                return
-
-            try:
-                success, message = register_user(
-                    user_name,
-                    nume,
-                    data_nasterii,
-                    parola
-                )
-
-                show_message(message)
-
-                if success:
-                    show_login()
-
-            except Exception as ex:
-                print("Eroare la înregistrare:", repr(ex))
-                show_message("Eroare la crearea contului.")
-
-        page.add(
-            ft.Text("Creare cont", size=25),
-            name,
-            username,
-            birth_date,
-            password,
-            ft.Button("Creează cont", on_click=submit),
-            ft.TextButton(
-                "Ai deja cont? Autentifică-te",
-                on_click=show_login
-            )
-        )
-
-        page.update()
-
-    def show_login(e=None):
-        page.clean()
-
-        username = ft.TextField(label="Username")
-        password = ft.TextField(
-            label="Parolă",
-            password=True,
-            can_reveal_password=True
-        )
-
-        def submit(e):
-            user_name = (username.value or "").strip()
-            parola = password.value or ""
-
-            if not user_name or not parola:
-                show_message("Completează username-ul și parola.")
-                return
-
-            try:
-                user = login_user(user_name, parola)
-
-                if user:
-                    show_home(user)
-                else:
-                    show_message("Username sau parolă incorectă.")
-
-            except Exception as ex:
-                print("Eroare la autentificare:", repr(ex))
-                show_message("Eroare la autentificare.")
-
-        page.add(
-            ft.Text("InstaGenie", size=30),
-            ft.Text("Autentificare", size=20),
-            username,
-            password,
-            ft.Button("Intră în cont", on_click=submit),
-            ft.TextButton(
-                "Nu ai cont? Înregistrează-te",
-                on_click=show_register
-            )
-        )
-
-        page.update()
-
-    show_login()
+    finally:
+        con.close()
 
 
-ft.run(main)
+def remove_product_status(product_id, user_id):
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        DELETE FROM wishlist_interactions
+        WHERE product_id = ? AND user_id = ?
+    """, (product_id, user_id))
+
+    con.commit()
+    con.close()
+
+
+def get_product_interactions(product_id, viewer_id, owner_id):
+    # Protecție suplimentară: proprietarul nu vede niciodată stările
+    if viewer_id == owner_id:
+        return []
+
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT users.username, users.name,
+               wishlist_interactions.status
+        FROM wishlist_interactions
+        JOIN users
+            ON users.id = wishlist_interactions.user_id
+        WHERE wishlist_interactions.product_id = ?
+    """, (product_id,))
+
+    rows = cur.fetchall()
+    con.close()
+
+    return [
+        {
+            "username": row[0],
+            "name": row[1],
+            "status": row[2]
+        }
+        for row in rows
+    ]
